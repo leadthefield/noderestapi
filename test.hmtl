@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Word Document Merger</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+  body { font-family: "Segoe UI", Arial, sans-serif; background: #f3f5f9; margin: 0; color: #222; }
+  header { background: #2b579a; color: #fff; padding: 18px 28px; }
+  header h1 { margin: 0; font-size: 22px; }
+  main { max-width: 900px; margin: 24px auto; padding: 0 16px; }
+  #drop { border: 3px dashed #2b579a; border-radius: 10px; padding: 36px; text-align: center; background: #fff; cursor: pointer; }
+  #drop.over { background: #e6eefb; }
+  .bar { display: flex; gap: 10px; flex-wrap: wrap; margin: 16px 0; align-items: center; }
+  button { background: #2b579a; color: #fff; border: 0; border-radius: 6px; padding: 9px 14px; cursor: pointer; font-size: 14px; }
+  button.sec { background: #fff; color: #2b579a; border: 1px solid #2b579a; }
+  button:disabled { opacity: .4; cursor: default; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  #list li { background: #fff; border: 1px solid #d5dbe5; border-radius: 8px; margin: 6px 0; padding: 10px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  #list li.dragging { opacity: .4; }
+  #list li.over { border-top: 3px solid #2b579a; }
+  .num { font-weight: bold; width: 28px; text-align: right; color: #2b579a; }
+  .handle { cursor: grab; font-size: 18px; color: #888; }
+  .name { flex: 1; min-width: 180px; word-break: break-all; }
+  .warn { color: #b35c00; font-size: 12px; }
+  .err { color: #c00; font-size: 12px; }
+  .small { padding: 4px 8px; font-size: 12px; }
+  #modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.5); align-items: center; justify-content: center; }
+  #modal .box { background: #fff; border-radius: 10px; max-width: 600px; width: 90%; padding: 22px; max-height: 80vh; overflow: auto; }
+  #mList li { padding: 4px 0; }
+  #outname { padding: 8px; flex: 1; border: 1px solid #ccc; border-radius: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Word Document Merger</h1>
+  <div>Upload, select, reorder, and download one merged Word document.</div>
+</header>
+
+<main>
+  <div id="drop">
+    Drag &amp; drop Word files (.docx) here, or click to choose.<br>
+    <small>No limit on the number of files. Files never leave your computer.</small>
+    <input type="file" id="file" multiple accept=".docx,.docm,.dotx,.doc" hidden>
+  </div>
+
+  <div class="bar">
+    <button class="sec" id="selAll">Select all</button>
+    <button class="sec" id="selNone">Select none</button>
+    <button class="sec" id="sortName">Sort A–Z</button>
+    <button class="sec" id="clear">Remove all</button>
+    <label><input type="checkbox" id="pgbreak" checked> Start each document on a new page</label>
+  </div>
+
+  <ul id="list"></ul>
+
+  <div class="bar">
+    <input id="outname" value="Merged Document" aria-label="Output file name">
+    <button id="dl" disabled>Download merged document</button>
+  </div>
+  <p id="status"></p>
+</main>
+
+<div id="modal">
+  <div class="box">
+    <h2>Before you download</h2>
+    <ul id="mList"></ul>
+    <div class="bar">
+      <button id="mOk">Download</button>
+      <button class="sec" id="mCancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let docs = [], uid = 0, dragId = null;
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// ---------- Uploading ----------
+$('drop').onclick = () => $('file').click();
+$('file').onchange = e => { addFiles(e.target.files); e.target.value = ''; };
+['dragover','dragenter'].forEach(t => $('drop').addEventListener(t, e => { e.preventDefault(); $('drop').classList.add('over'); }));
+['dragleave','drop'].forEach(t => $('drop').addEventListener(t, e => { e.preventDefault(); $('drop').classList.remove('over'); }));
+$('drop').addEventListener('drop', e => addFiles(e.dataTransfer.files));
+
+async function addFiles(files) {
+  for (const f of Array.from(files)) {
+    const d = { id: ++uid, name: f.name, file: f, selected: true, warnings: [], error: null };
+    docs.push(d);
+    render();
+    await inspect(d);
+    render();
+  }
+}
+
+// ---------- Checking each file for problems ----------
+async function inspect(d) {
+  const ext = d.name.split('.').pop().toLowerCase();
+  if (ext === 'doc') {
+    d.error = 'Old .doc format cannot be merged. Open it in Word and use Save As .docx.';
+    d.selected = false; return;
+  }
+  try {
+    d.buf = await d.file.arrayBuffer();
+    const z = await JSZip.loadAsync(d.buf);
+    const doc = z.file('word/document.xml');
+    if (!doc) { d.error = 'Not a valid Word document.'; d.selected = false; return; }
+    const x = await doc.async('string');
+    if (ext === 'docm' || z.file('word/vbaProject.bin')) d.warnings.push('Contains macros; macros will not be carried into the merged file.');
+    if (ext === 'dotx') d.warnings.push('This is a template; its content will be merged as a normal document.');
+    if (/<w:(ins|del)\b/.test(x)) d.warnings.push('Has tracked changes; Word may accept them when it combines the files.');
+    if (z.file('word/comments.xml')) d.warnings.push('Has comments; they may not carry over.');
+    if (/<w:(headerReference|footerReference)/.test(x)) d.warnings.push("Has headers/footers; Word may use the first document's headers/footers for the merged pages.");
+    if (!/<w:t[ >]/.test(x) && !/<w:drawing|<w:pict/.test(x)) d.warnings.push('Appears to be empty.');
+    if (docs.some(o => o !== d && o.name === d.name)) d.warnings.push('Duplicate file name. Check you meant to add it twice.');
+  } catch (e) {
+    d.error = 'Could not read file (it may be password-protected or corrupted).';
+    d.selected = false;
+  }
+}
+
+// ---------- List display and reordering ----------
+function render() {
+  const L = $('list');
+  L.innerHTML = '';
+  docs.forEach((d, i) => {
+    const li = document.createElement('li');
+    li.draggable = true;
+    li.dataset.id = d.id;
+    li.innerHTML =
+      '<span class="handle" title="Drag to reorder">☰</span>' +
+      '<span class="num">' + (i + 1) + '.</span>' +
+      '<input type="checkbox" class="pick" ' + (d.selected ? 'checked ' : '') + (d.error ? 'disabled' : '') + '>' +
+      '<span class="name">' + esc(d.name) +
+        (d.error ? '<div class="err">✖ ' + esc(d.error) + '</div>' : '') +
+        d.warnings.map(w => '<div class="warn">⚠ ' + esc(w) + '</div>').join('') +
+      '</span>' +
+      '<button class="sec small" data-a="top">Top</button>' +
+      '<button class="sec small" data-a="up">▲</button>' +
+      '<button class="sec small" data-a="down">▼</button>' +
+      '<button class="sec small" data-a="bot">Bottom</button>' +
+      '<input type="number" class="pos" min="1" max="' + docs.length + '" value="' + (i + 1) + '" style="width:52px" title="Move to position">' +
+      '<button class="sec small" data-a="del" title="Remove">✕</button>';
+
+    li.querySelector('.pick').onchange = e => { d.selected = e.target.checked; upd(); };
+    li.querySelector('.pos').onchange = e => move(i, Math.max(0, Math.min(docs.length - 1, (parseInt(e.target.value, 10) || 1) - 1)));
+    li.querySelectorAll('button').forEach(b => b.onclick = () => {
+      const a = b.dataset.a;
+      if (a === 'up') move(i, i - 1);
+      if (a === 'down') move(i, i + 1);
+      if (a === 'top') move(i, 0);
+      if (a === 'bot') move(i, docs.length - 1);
+      if (a === 'del') { docs.splice(i, 1); render(); }
+    });
+
+    li.ondragstart = () => { dragId = d.id; li.classList.add('dragging'); };
+    li.ondragend = () => li.classList.remove('dragging');
+    li.ondragover = e => { e.preventDefault(); li.classList.add('over'); };
+    li.ondragleave = () => li.classList.remove('over');
+    li.ondrop = e => {
+      e.preventDefault(); e.stopPropagation();
+      const from = docs.findIndex(x => x.id === dragId);
+      if (from > -1) move(from, i);
+    };
+    L.appendChild(li);
+  });
+  upd();
+}
+
+function move(a, b) {
+  if (b < 0 || b >= docs.length || a === b) { render(); return; }
+  const [x] = docs.splice(a, 1);
+  docs.splice(b, 0, x);
+  render();
+}
+
+function upd() {
+  const n = docs.filter(d => d.selected && !d.error).length;
+  $('dl').disabled = n === 0;
+  $('status').textContent = docs.length + ' file(s) uploaded, ' + n + ' selected for merging.';
+}
+
+$('selAll').onclick = () => { docs.forEach(d => { if (!d.error) d.selected = true; }); render(); };
+$('selNone').onclick = () => { docs.forEach(d => d.selected = false); render(); };
+$('sortName').onclick = () => { docs.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })); render(); };
+$('clear').onclick = () => { if (confirm('Remove all files?')) { docs = []; render(); } };
+
+// ---------- Download notice ----------
+$('dl').onclick = () => {
+  const sel = docs.filter(d => d.selected && !d.error);
+  const notes = ["Each document's original formatting is kept by embedding it intact. Open the merged file in Microsoft Word (desktop or web); Google Docs, LibreOffice and Pages may not display it correctly. To make it a fully standard Word file, open it in Word and click Save once."];
+  docs.filter(d => d.error).forEach(d => notes.push('<b>' + esc(d.name) + '</b> will be skipped: ' + esc(d.error)));
+  docs.filter(d => !d.selected && !d.error).forEach(d => notes.push('<b>' + esc(d.name) + '</b> is unselected and will be left out.'));
+  sel.forEach(d => d.warnings.forEach(w => notes.push('<b>' + esc(d.name) + '</b>: ' + esc(w))));
+  notes.push('Final order:<br>' + sel.map((d, i) => (i + 1) + '. ' + esc(d.name)).join('<br>'));
+  $('mList').innerHTML = notes.map(n => '<li>• ' + n + '</li>').join('');
+  $('modal').style.display = 'flex';
+};
+$('mCancel').onclick = () => $('modal').style.display = 'none';
+$('mOk').onclick = async () => {
+  $('modal').style.display = 'none';
+  $('status').textContent = 'Building merged document…';
+  try { await build(docs.filter(d => d.selected && !d.error)); }
+  catch (e) { alert('Merge failed: ' + e.message); }
+  upd();
+};
+
+// ---------- Building the merged .docx ----------
+async function build(sel) {
+  const z = new JSZip();
+  const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+  const R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  let ov = '', rels = '', body = '';
+
+  sel.forEach((d, i) => {
+    const n = i + 1;
+    z.file('word/chunk' + n + '.docx', d.buf);
+    ov += '<Override PartName="/word/chunk' + n + '.docx" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>';
+    rels += '<Relationship Id="rChunk' + n + '" Type="' + R + '/aFChunk" Target="chunk' + n + '.docx"/>';
+    if (i > 0 && $('pgbreak').checked) body += '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
+    body += '<w:altChunk r:id="rChunk' + n + '"/>';
+  });
+
+  z.file('[Content_Types].xml',
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+    '<Default Extension="xml" ContentType="application/xml"/>' +
+    '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
+    ov + '</Types>');
+  z.file('_rels/.rels',
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+    '<Relationship Id="rId1" Type="' + R + '/officeDocument" Target="word/document.xml"/></Relationships>');
+  z.file('word/_rels/document.xml.rels',
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + rels + '</Relationships>');
+  z.file('word/document.xml',
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<w:document xmlns:w="' + W + '" xmlns:r="' + R + '"><w:body>' + body + '<w:sectPr/></w:body></w:document>');
+
+  const blob = await z.generateAsync({ type: 'blob', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = ($('outname').value.trim() || 'Merged Document').replace(/[\\/:*?"<>|]/g, '') + '.docx';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+</script>
+</body>
+</html>
